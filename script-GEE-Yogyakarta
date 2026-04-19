@@ -1,0 +1,587 @@
+/***************************************
+ * YOGYAKARTA LANDSLIDE MAP + DATASET
+ * FINAL FULL SCRIPT
+ * - Use basemap labels (same map font style)
+ * - No custom river labels
+ * - Smaller red and black points
+ * - English legend
+ ***************************************/
+
+// =====================================
+// 1. PARAMETERS
+// =====================================
+var startDate = '2024-01-01';
+var endDate   = '2024-12-31';
+var rainRefDate = ee.Date(endDate);
+
+var nPoints = 1200;
+var scale = 30;
+
+// =====================================
+// 2. AOI YOGYAKARTA
+// =====================================
+var adm1 = ee.FeatureCollection('FAO/GAUL/2015/level1');
+
+var yogyakarta = adm1
+  .filter(ee.Filter.eq('ADM0_NAME', 'Indonesia'))
+  .filter(
+    ee.Filter.or(
+      ee.Filter.eq('ADM1_NAME', 'Daerah Istimewa Yogyakarta'),
+      ee.Filter.eq('ADM1_NAME', 'Yogyakarta'),
+      ee.Filter.stringContains('ADM1_NAME', 'Yogya')
+    )
+  );
+
+var aoi = yogyakarta.geometry();
+
+Map.clear();
+Map.centerObject(aoi, 10);
+
+// =====================================
+// 3. DISTRICT / CITY BOUNDARIES
+// =====================================
+var adminBoundaries = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.eq('ADM0_NAME', 'Indonesia'))
+  .filter(
+    ee.Filter.or(
+      ee.Filter.eq('ADM1_NAME', 'Daerah Istimewa Yogyakarta'),
+      ee.Filter.eq('ADM1_NAME', 'Yogyakarta')
+    )
+  );
+
+// =====================================
+// 4. CITY / PLACE POINTS
+// Note: names follow basemap font naturally
+// =====================================
+var places = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([110.3671, -7.8014]), {name: 'Yogyakarta'}),
+  ee.Feature(ee.Geometry.Point([110.3695, -7.7163]), {name: 'Sleman'}),
+  ee.Feature(ee.Geometry.Point([110.3253, -7.8889]), {name: 'Bantul'}),
+  ee.Feature(ee.Geometry.Point([110.1990, -7.8267]), {name: 'Wates'}),
+  ee.Feature(ee.Geometry.Point([110.6124, -7.9586]), {name: 'Wonosari'})
+]);
+
+// =====================================
+// 5. MOUNTAIN POINTS
+// =====================================
+var mountains = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([110.4461, -7.5407]), {name: 'Merapi'})
+]);
+
+// =====================================
+// 6. LANDSLIDE POINTS (RED)
+// Replace with your real asset if available
+// =====================================
+var landslidePoints = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([110.445, -7.846]), {id: 1}),
+  ee.Feature(ee.Geometry.Point([110.478, -7.913]), {id: 2}),
+  ee.Feature(ee.Geometry.Point([110.550, -7.955]), {id: 3}),
+  ee.Feature(ee.Geometry.Point([110.390, -7.730]), {id: 4}),
+  ee.Feature(ee.Geometry.Point([110.620, -7.890]), {id: 5}),
+  ee.Feature(ee.Geometry.Point([110.305, -7.840]), {id: 6}),
+  ee.Feature(ee.Geometry.Point([110.510, -7.780]), {id: 7})
+]).filterBounds(aoi);
+
+// Buffer for Ground Truth
+var landslideBuffer = landslidePoints.map(function(f) {
+  return f.buffer(150);
+}).geometry();
+
+// =====================================
+// 7. TOPOGRAPHY
+// =====================================
+var dem = ee.Image('USGS/SRTMGL1_003').clip(aoi);
+var terrain = ee.Terrain.products(dem);
+
+var elevation = dem.rename('Elevation');
+var slope = terrain.select('slope').rename('Slope');
+var aspect = terrain.select('aspect').rename('Aspect');
+var hillshade = terrain.select('hillshade').rename('Hillshade');
+
+var localMean = dem.focal_mean({
+  radius: 90,
+  units: 'meters'
+});
+var tpi = dem.subtract(localMean).rename('TPI');
+var roughness = dem.focal_max(1).subtract(dem.focal_min(1)).rename('Roughness');
+var curvature = dem.convolve(ee.Kernel.laplacian8()).rename('Curvature');
+
+// =====================================
+// 8. TOPOGRAPHY VISUAL
+// =====================================
+var elevationVis = {
+  min: 0,
+  max: 1200,
+  palette: [
+    'd8f3dc','b7e4c7','95d5b2','74c69d','52b788',
+    '40916c','2d6a4f','c2b280','a98467','7f5539','4b2e1f'
+  ]
+};
+
+var contourInterval = 50;
+var contours = dem.divide(contourInterval).floor().multiply(contourInterval);
+var contourLines = contours.subtract(contours.focal_min(1)).neq(0).selfMask();
+
+// =====================================
+// 9. RAINFALL
+// =====================================
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+  .filterBounds(aoi);
+
+var rain7 = chirps
+  .filterDate(rainRefDate.advance(-7, 'day'), rainRefDate)
+  .sum()
+  .rename('Rain_7d');
+
+var rain30 = chirps
+  .filterDate(rainRefDate.advance(-30, 'day'), rainRefDate)
+  .sum()
+  .rename('Rain_30d');
+
+var rainYear = chirps
+  .filterDate(startDate, endDate)
+  .sum()
+  .rename('Rain_year');
+
+// =====================================
+// 10. SENTINEL-2
+// =====================================
+function maskS2(img) {
+  var scl = img.select('SCL');
+  var mask = scl.neq(3)
+    .and(scl.neq(8))
+    .and(scl.neq(9))
+    .and(scl.neq(10))
+    .and(scl.neq(11));
+
+  return img.updateMask(mask).divide(10000);
+}
+
+function addIndices(img) {
+  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var ndmi = img.normalizedDifference(['B8', 'B11']).rename('NDMI');
+  var nbr  = img.normalizedDifference(['B8', 'B12']).rename('NBR');
+
+  var bsi = img.expression(
+    '((SWIR + RED) - (NIR + BLUE)) / ((SWIR + RED) + (NIR + BLUE))',
+    {
+      SWIR: img.select('B11'),
+      RED: img.select('B4'),
+      NIR: img.select('B8'),
+      BLUE: img.select('B2')
+    }
+  ).rename('BSI');
+
+  return img.addBands([ndvi, ndmi, nbr, bsi]);
+}
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterDate(startDate, endDate)
+  .filterBounds(aoi)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 70))
+  .map(maskS2)
+  .map(addIndices);
+
+var s2Median = s2.median().clip(aoi);
+
+var ndvi = s2Median.select('NDVI');
+var ndmi = s2Median.select('NDMI');
+var nbr  = s2Median.select('NBR');
+var bsi  = s2Median.select('BSI');
+
+// =====================================
+// 11. LAND COVER
+// =====================================
+var worldcover = ee.ImageCollection('ESA/WorldCover/v200')
+  .first()
+  .clip(aoi);
+
+var landcover = worldcover.select('Map').rename('Landcover');
+var treecover = landcover.eq(10).rename('Treecover');
+var cropland  = landcover.eq(40).rename('Cropland');
+var builtup   = landcover.eq(50).rename('Builtup');
+
+// =====================================
+// 12. MAJOR RIVERS ONLY
+// =====================================
+var riversRaw = ee.FeatureCollection('WWF/HydroSHEDS/v1/FreeFlowingRivers')
+  .filterBounds(aoi);
+
+var rivers = riversRaw.map(function(f) {
+  return f.set('geom_len', f.geometry().length(1));
+}).filter(ee.Filter.gte('geom_len', 15000));
+
+var riverRaster = ee.Image().byte().paint(rivers, 1).clip(aoi);
+
+var distanceToRiver = riverRaster
+  .not()
+  .distance(ee.Kernel.euclidean(5000, 'meters'))
+  .rename('Distance_to_River');
+
+// =====================================
+// 13. LONGITUDE & LATITUDE
+// =====================================
+var lonlat = ee.Image.pixelLonLat();
+var longitude = lonlat.select('longitude').rename('Longitude');
+var latitude  = lonlat.select('latitude').rename('Latitude');
+
+// =====================================
+// 14. LANDSLIDE PREDICTION SCORE
+// More permissive thresholds for more black points
+// =====================================
+var slopeScore = ee.Image(0)
+  .where(slope.gte(6).and(slope.lt(12)), 1)
+  .where(slope.gte(12).and(slope.lt(22)), 2)
+  .where(slope.gte(22), 3);
+
+var rain7Score = ee.Image(0)
+  .where(rain7.gte(30).and(rain7.lt(70)), 1)
+  .where(rain7.gte(70).and(rain7.lt(120)), 2)
+  .where(rain7.gte(120), 3);
+
+var ndmiScore = ee.Image(0)
+  .where(ndmi.gte(0.03).and(ndmi.lt(0.15)), 1)
+  .where(ndmi.gte(0.15).and(ndmi.lt(0.30)), 2)
+  .where(ndmi.gte(0.30), 3);
+
+var tpiAbs = tpi.abs();
+var tpiScore = ee.Image(0)
+  .where(tpiAbs.gte(3).and(tpiAbs.lt(12)), 1)
+  .where(tpiAbs.gte(12).and(tpiAbs.lt(25)), 2)
+  .where(tpiAbs.gte(25), 3);
+
+var riverScore = ee.Image(0)
+  .where(distanceToRiver.lte(1500).and(distanceToRiver.gt(700)), 1)
+  .where(distanceToRiver.lte(700).and(distanceToRiver.gt(300)), 2)
+  .where(distanceToRiver.lte(300), 3);
+
+var landslideScore = slopeScore.multiply(0.30)
+  .add(rain7Score.multiply(0.20))
+  .add(ndmiScore.multiply(0.20))
+  .add(tpiScore.multiply(0.15))
+  .add(riverScore.multiply(0.15))
+  .rename('Landslide_Score');
+
+var predictionClass = ee.Image(1)
+  .where(landslideScore.gte(1.10).and(landslideScore.lt(1.70)), 2)
+  .where(landslideScore.gte(1.70), 3)
+  .rename('Prediction_Class');
+
+// =====================================
+// 15. FEATURE STACK
+// =====================================
+var featuresImage = ee.Image.cat([
+  elevation,
+  slope,
+  aspect,
+  hillshade,
+  tpi,
+  roughness,
+  curvature,
+  rain7,
+  rain30,
+  rainYear,
+  ndvi,
+  ndmi,
+  nbr,
+  bsi,
+  distanceToRiver,
+  landcover,
+  treecover,
+  cropland,
+  builtup,
+  longitude,
+  latitude,
+  landslideScore,
+  predictionClass
+]).clip(aoi).unmask(-9999);
+
+// =====================================
+// 16. SAMPLE DATASET
+// =====================================
+var randomPoints = ee.FeatureCollection.randomPoints({
+  region: aoi,
+  points: nPoints,
+  seed: 42,
+  maxError: 1
+});
+
+var samples = featuresImage.sampleRegions({
+  collection: randomPoints,
+  scale: scale,
+  geometries: true,
+  tileScale: 8
+}).map(function(f) {
+  var coords = f.geometry().coordinates();
+
+  var gt = ee.Number(
+    ee.Algorithms.If(f.geometry().intersects(landslideBuffer, 1), 1, 0)
+  );
+
+  var predClass = ee.Number(f.get('Prediction_Class'));
+  var predLabel = ee.String(
+    ee.Algorithms.If(
+      predClass.eq(3), 'High',
+      ee.Algorithms.If(predClass.eq(2), 'Moderate', 'Low')
+    )
+  );
+
+  return f.set({
+    ID: ee.String(f.get('system:index')),
+    Region: 'DI_Yogyakarta',
+    Latitude: coords.get(1),
+    Longitude: coords.get(0),
+    Ground_Truth: gt,
+    Prediction_Landslide: predLabel,
+    Observation_Time: ee.Date(Date.now()).format('YYYY-MM-dd HH:mm:ss')
+  });
+});
+
+print('Sample preview:', samples.limit(5));
+print('Record count:', samples.size());
+
+// =====================================
+// 17. PREDICTED LANDSLIDE POINTS (BLACK)
+// Show Moderate + High
+// =====================================
+var predictedPoints = samples.filter(ee.Filter.gte('Prediction_Class', 2));
+
+// =====================================
+// 18. MAP DISPLAY
+// =====================================
+Map.addLayer(dem, elevationVis, 'Colored elevation', true);
+
+Map.addLayer(contourLines, {
+  palette: ['000000'],
+  opacity: 0.22
+}, 'Contours 50m', true);
+
+Map.addLayer(
+  rivers.style({
+    color: '#FFD700',
+    width: 2
+  }),
+  {},
+  'Major rivers',
+  true
+);
+
+Map.addLayer(
+  yogyakarta.style({
+    color: '#ff0000',
+    fillColor: '00000000',
+    width: 2
+  }),
+  {},
+  'DIY boundary',
+  true
+);
+
+Map.addLayer(
+  adminBoundaries.style({
+    color: '#222222',
+    fillColor: '00000000',
+    width: 1
+  }),
+  {},
+  'District boundaries',
+  false
+);
+
+Map.addLayer(
+  places.style({
+    color: '#000000',
+    pointSize: 3,
+    pointShape: 'circle',
+    width: 1
+  }),
+  {},
+  'Cities / places',
+  true
+);
+
+Map.addLayer(
+  mountains.style({
+    color: '#8B4513',
+    pointSize: 6,
+    pointShape: 'triangle',
+    width: 1
+  }),
+  {},
+  'Mountain',
+  true
+);
+
+Map.addLayer(
+  landslidePoints.style({
+    color: '#FF1A1A',
+    pointSize: 3,
+    pointShape: 'circle',
+    width: 1
+  }),
+  {},
+  'Landslide points',
+  true
+);
+
+Map.addLayer(
+  predictedPoints.style({
+    color: '#000000',
+    pointSize: 1,
+    pointShape: 'circle',
+    width: 1
+  }),
+  {},
+  'Predicted landslide points',
+  true
+);
+
+// =====================================
+// 19. LEGEND (ENGLISH)
+// =====================================
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '10px 12px',
+    backgroundColor: 'rgba(255,255,255,0.92)',
+    width: '220px'
+  }
+});
+
+legend.add(ui.Label({
+  value: 'Map Legend',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '13px',
+    margin: '0 0 8px 0',
+    color: '#111111'
+  }
+}));
+
+function legendRow(color, label, type) {
+  var symbol;
+  if (type === 'line') {
+    symbol = ui.Label({
+      value: '━━',
+      style: {
+        color: color,
+        fontSize: '13px',
+        margin: '0 8px 4px 0'
+      }
+    });
+  } else if (type === 'triangle') {
+    symbol = ui.Label({
+      value: '▲',
+      style: {
+        color: color,
+        fontSize: '14px',
+        margin: '0 8px 4px 0'
+      }
+    });
+  } else {
+    symbol = ui.Label({
+      style: {
+        backgroundColor: color,
+        padding: '6px',
+        margin: '0 8px 4px 0'
+      }
+    });
+  }
+
+  var txt = ui.Label({
+    value: label,
+    style: {
+      fontSize: '11px',
+      margin: '0 0 4px 0'
+    }
+  });
+
+  legend.add(ui.Panel([symbol, txt], ui.Panel.Layout.Flow('horizontal')));
+}
+
+legendRow('#ff0000', 'DIY boundary', 'line');
+legendRow('#FFD700', 'Major rivers', 'line');
+legendRow('#8B4513', 'Mountain', 'triangle');
+legendRow('#FF1A1A', 'Observed landslides', 'box');
+legendRow('#000000', 'Predicted landslides', 'box');
+legendRow('#000000', 'Contours', 'line');
+
+legend.add(ui.Label({
+  value: 'Elevation',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '11px',
+    margin: '8px 0 4px 0'
+  }
+}));
+
+var elevationPalette = [
+  'd8f3dc','b7e4c7','95d5b2','74c69d','52b788',
+  '40916c','2d6a4f','c2b280','a98467','7f5539','4b2e1f'
+];
+
+var colorBar = ui.Thumbnail({
+  image: ee.Image.pixelLonLat().select(0),
+  params: {
+    bbox: [0, 0, 1, 0.1],
+    dimensions: '200x16',
+    format: 'png',
+    min: 0,
+    max: 1,
+    palette: elevationPalette
+  },
+  style: {stretch: 'horizontal', margin: '0px 8px'}
+});
+
+legend.add(colorBar);
+
+legend.add(ui.Panel([
+  ui.Label('Low', {margin: '4px 8px', fontSize: '10px'}),
+  ui.Label('High', {
+    margin: '4px 8px',
+    fontSize: '10px',
+    textAlign: 'right',
+    stretch: 'horizontal'
+  })
+], ui.Panel.Layout.Flow('horizontal')));
+
+Map.add(legend);
+
+// =====================================
+// 20. EXPORT CSV
+// =====================================
+Export.table.toDrive({
+  collection: samples,
+  description: 'Dataset_Landslide_Yogyakarta_1200_WithPrediction_GT_Final',
+  fileFormat: 'CSV',
+  selectors: [
+    'ID',
+    'Latitude',
+    'Longitude',
+    'Region',
+    'Elevation',
+    'Slope',
+    'Aspect',
+    'Hillshade',
+    'TPI',
+    'Roughness',
+    'Curvature',
+    'Rain_7d',
+    'Rain_30d',
+    'Rain_year',
+    'NDVI',
+    'NDMI',
+    'NBR',
+    'BSI',
+    'Distance_to_River',
+    'Landcover',
+    'Treecover',
+    'Cropland',
+    'Builtup',
+    'Landslide_Score',
+    'Prediction_Class',
+    'Prediction_Landslide',
+    'Ground_Truth',
+    'Observation_Time'
+  ]
+});
